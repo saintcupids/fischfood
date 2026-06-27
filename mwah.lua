@@ -667,6 +667,11 @@ local Macro = {
     appraiseEndCoins       = "",
     appraiseState          = "IDLE",
     appraiseLastError      = "",
+
+    reelSessionActive     = false,
+    reelSessionStartedAt  = 0,
+    reelMissingAt         = 0,
+    reelLastContextAt     = 0,
 }
 
 local ROD = ""
@@ -2690,10 +2695,41 @@ local function stopMacroCycle(nextPhase)
     end
 end
 
-local function updateReelWatchPhase()
+local function resetReelEngine()
+    releaseMouse(true); RP.releaseMouse2()
+    controller:Reset(); controllerR:Reset()
+    Macro.reelSessionActive = false
+    Macro.reelSessionStartedAt = 0
+    Macro.reelMissingAt = 0
+    Macro.reelLastContextAt = 0
+    Macro.hadMetricsLastTick = false
+    Macro.fishInputReadyAt = 0
+    Macro.startupActive = false
+    Macro.startupStartedAt = 0
+    Macro.startupStartFish = nil
+    Macro.fhHoldStartedAt = 0
+    Macro.fhMotionAt = 0
+    Macro.fhLastFish = nil
+    Macro.fhLastBar = nil
+    Macro.fhLastProg = nil
+    Macro.reelInsaneStreak = 0
+    Macro.reelGui = nil; Macro.reelBar = nil; Macro.fishInst = nil
+    Macro.playerbar = nil; Macro.progressBar = nil; Macro.reelVerifiedAt = 0
+end
 
+local function beginReelEngine()
+    resetReelEngine()
+    Macro.reelSessionActive = true
+    Macro.reelSessionStartedAt = tick() * 1000
+    Macro.reelLastContextAt = Macro.reelSessionStartedAt
+    Macro.completionReached = false
+    Macro.outcomeResolved = false
+    Macro.fishingLostAt = 0
+end
+
+local function updateReelWatchPhase()
     Macro.powerPercent = ""; Macro.progressPercent = ""
-    releaseMouse()
+    -- Passive mode: do not touch mouse input while the user casts manually.
 end
 
 local function updateCastingPhase()
@@ -2801,132 +2837,102 @@ end
 
 local function updateFishingPhase()
     Macro.powerPercent = ""
+    local nowMs = tick() * 1000
     local visible = reelGuiVisible()
-    local ctx     = visible and getReelBarContext() or nil
-    local prog    = getFishingCompletionPercent()
+    local ctx = visible and getReelBarContext() or nil
+    local prog = getFishingCompletionPercent()
     Macro.progressPercent = prog and tostring(math.floor(prog + 0.5)) or ""
+
+    if not Macro.reelSessionActive then beginReelEngine() end
     if prog and prog >= MAIN.completion_threshold then Macro.completionReached = true end
-    if Macro.completionReached then
-        releaseMouse(true); RP.releaseMouse2()
-        controller:Reset(); controllerR:Reset()
-        if visible then Macro.fishingLostAt = 0; return end
-        ctx = nil
-    end
 
     local isMetro = (ROD_KIND == "lullaby") or RP.metronomeActive()
     if MAIN.debug_logging == 1 then Macro.dbgReelVis = visible; Macro.dbgMetro = isMetro end
-    if ctx and not isMetro and ROD_KIND ~= "bellona" then
-        if RP.reelMetricsSane(ctx) then
-            Macro.reelInsaneStreak = 0
-        else
 
-            Macro.reelInsaneStreak = (Macro.reelInsaneStreak or 0) + 1
-            if Macro.reelInsaneStreak >= 2 then
-                Macro.reelBar = nil; Macro.fishInst = nil; Macro.playerbar = nil
-                Macro.progressBar = nil; Macro.reelVerifiedAt = 0
-                ctx = nil
-            end
-        end
-    else
-        Macro.reelInsaneStreak = 0
+    if isMetro then
+        Macro.reelMissingAt = 0
+        Macro.reelLastContextAt = nowMs
+        RP.handleLullaby()
+        return
     end
-    if ctx then
-        Macro.fishingLostAt = 0
 
-        if isMetro then
-            RP.handleLullaby()
-            return
-        end
-
-        if ROD_KIND == "bellona" then
-            local reels = RP.getAllReelContexts()
-            if MAIN.debug_logging == 1 then Macro.dbgReels = #reels end
-            if #reels >= 2 then
-
-                Macro.bellonaMidX = (reels[1].x + reels[#reels].x) / 2
-                controller:Update(reels[1])
-                controllerR:Update(reels[#reels])
-            elseif #reels == 1 then
-
-                local r = reels[1]
-                if Macro.bellonaMidX and r.x > Macro.bellonaMidX then
-                    controllerR:Update(r); releaseMouse(); controller:Reset()
-                else
-                    controller:Update(r); RP.releaseMouse2(); controllerR:Reset()
-                end
+    if ROD_KIND == "bellona" and visible then
+        local reels = RP.getAllReelContexts()
+        Macro.reelMissingAt = 0
+        Macro.reelLastContextAt = nowMs
+        if #reels >= 2 then
+            Macro.bellonaMidX = (reels[1].x + reels[#reels].x) / 2
+            controller:Update(reels[1]); controllerR:Update(reels[#reels])
+        elseif #reels == 1 then
+            local r = reels[1]
+            if Macro.bellonaMidX and r.x > Macro.bellonaMidX then
+                controllerR:Update(r); releaseMouse(); controller:Reset()
             else
-                releaseMouse(); RP.releaseMouse2()
-            end
-            return
-        end
-        if hasActiveFishingContext(ctx) then
-            local nowMs = tick() * 1000
-
-            if not Macro.hadMetricsLastTick then
-                Macro.hadMetricsLastTick = true
-                Macro.fishInputReadyAt   = nowMs + 125
-                controller:Reset()
-                Macro.startupActive    = (MAIN.tracker_mode == "predict")
-                Macro.startupStartedAt = nowMs
-                Macro.startupStartFish = controller:GetFishPosition(ctx)
-            end
-            if nowMs < Macro.fishInputReadyAt then
-                releaseMouse(); return
-            end
-
-            if Macro.startupActive then
-                local fc = controller:GetFishPosition(ctx)
-                local fishMoved = Macro.startupStartFish and fc
-                    and math.abs(fc - Macro.startupStartFish) >= 0.0125
-                if fishMoved or (nowMs - Macro.startupStartedAt) >= 800 then
-                    Macro.startupActive = false
-                    controller:Reset()
-                else
-                    controller:UpdateSpam(ctx); return
-                end
-            end
-            controller:Update(ctx)
-
-            local f, b  = controller.obsFish, controller.obsBar
-            local moved = Macro.fhLastFish == nil or Macro.fhLastBar == nil
-                or (f and math.abs(f - Macro.fhLastFish) >= 0.0015)
-                or (b and math.abs(b - Macro.fhLastBar) >= 0.0015)
-            local progMoved = prog ~= nil and (Macro.fhLastProg == nil
-                or math.abs(prog - Macro.fhLastProg) >= 2.0)
-            if moved or progMoved then Macro.fhMotionAt = nowMs end
-            Macro.fhLastFish, Macro.fhLastBar, Macro.fhLastProg = f, b, prog
-            if not mouseHeld then
-                Macro.fhHoldStartedAt = 0
-            else
-                if Macro.fhHoldStartedAt == 0 then Macro.fhHoldStartedAt = nowMs end
-                if Macro.fhMotionAt == 0 then Macro.fhMotionAt = nowMs end
-                if (nowMs - Macro.fhHoldStartedAt) >= 1200
-                   and (nowMs - Macro.fhMotionAt) >= 3000 then
-                    releaseMouse(true); RP.releaseMouse2()
-                    controller:Reset(); controllerR:Reset()
-                    Macro.fhHoldStartedAt = 0; Macro.fhMotionAt = nowMs
-                    notify("Hold watchdog: reset a stuck reel.", "ZeroDeath fisch", 3)
-                end
+                controller:Update(r); RP.releaseMouse2(); controllerR:Reset()
             end
         else
-            releaseMouse()
+            releaseMouse(); RP.releaseMouse2()
         end
         return
     end
+
+    if ctx and hasActiveFishingContext(ctx) then
+        Macro.reelMissingAt = 0
+        Macro.reelLastContextAt = nowMs
+
+        if not Macro.hadMetricsLastTick then
+            Macro.hadMetricsLastTick = true
+            Macro.fishInputReadyAt = nowMs + 150
+            controller:Reset()
+            Macro.startupActive = (MAIN.tracker_mode == "predict")
+            Macro.startupStartedAt = nowMs
+            Macro.startupStartFish = controller:GetFishPosition(ctx)
+        end
+
+        if nowMs < Macro.fishInputReadyAt then
+            releaseMouse()
+            return
+        end
+
+        if Macro.startupActive then
+            local fc = controller:GetFishPosition(ctx)
+            local moved = Macro.startupStartFish and fc and math.abs(fc - Macro.startupStartFish) >= 0.0125
+            if moved or (nowMs - Macro.startupStartedAt) >= 650 then
+                Macro.startupActive = false
+                controller:Reset()
+            else
+                controller:UpdateSpam(ctx)
+                return
+            end
+        end
+
+        controller:Update(ctx)
+        return
+    end
+
+    -- Context reads can fail briefly in Matcha. Reacquire before deciding the reel ended.
     releaseMouse(); RP.releaseMouse2()
     controller:Reset(); controllerR:Reset()
     Macro.hadMetricsLastTick = false
-    if Macro.fishingLostAt == 0 then Macro.fishingLostAt = tick() * 1000 end
+    Macro.reelGui = nil; Macro.reelBar = nil; Macro.fishInst = nil
+    Macro.playerbar = nil; Macro.progressBar = nil; Macro.reelVerifiedAt = 0
 
-    local graceMs = Macro.completionReached and Macro.fishingEndGraceMs or 2500
-    if (tick()*1000 - Macro.fishingLostAt) >= graceMs then
-        if not Macro.outcomeResolved then
-            Macro.outcomeResolved = true
-            if Macro.completionReached then Macro.fishCaughtCount = Macro.fishCaughtCount + 1
-            else                            Macro.fishLostCount   = Macro.fishLostCount + 1 end
-        end
-        stopMacroCycle("DONE")
+    if visible then
+        if Macro.reelMissingAt == 0 then Macro.reelMissingAt = nowMs end
+        if (nowMs - Macro.reelMissingAt) < 700 then return end
+    else
+        if Macro.reelMissingAt == 0 then Macro.reelMissingAt = nowMs end
+        local endGrace = Macro.completionReached and 150 or 1200
+        if (nowMs - Macro.reelMissingAt) < endGrace then return end
     end
+
+    if not Macro.outcomeResolved then
+        Macro.outcomeResolved = true
+        if Macro.completionReached then Macro.fishCaughtCount = Macro.fishCaughtCount + 1
+        else Macro.fishLostCount = Macro.fishLostCount + 1 end
+    end
+    resetReelEngine()
+    Macro.phase = "DONE"
 end
 
 local function updateTranquilityPhase()
@@ -3052,9 +3058,8 @@ local function macroTick()
         if ph == "CASTING" or ph == "CASTED" or ph == "SHAKE" or ph == "REELWATCH" then
             local mg = fishingMinigameActive()
             if mg and mg ~= ph then
-                releaseMouse(true)
+                beginReelEngine()
                 Macro.lastShakedAt = 0; Macro.fishingLostAt = 0
-                Macro.completionReached = false; Macro.outcomeResolved = false
                 Macro.phase = mg
             elseif (ph == "CASTING" or ph == "CASTED") and RP.shakeButtonVisible() then
 
@@ -3121,7 +3126,16 @@ local function macroTick()
     elseif p == "FISHING"     then updateFishingPhase()
     elseif p == "TRANQUILITY" then updateTranquilityPhase()
     elseif p == "DONE"        then
-        if Macro.cycleEnabled then startMacroCycle() else stopMacroCycle("OFF") end
+        if not Macro.cycleEnabled then
+            stopMacroCycle("OFF")
+        elseif MAIN.auto_reel_only == 1 then
+            resetReelEngine()
+            Macro.powerPercent = ""; Macro.progressPercent = ""
+            Macro.completionReached = false; Macro.outcomeResolved = false
+            Macro.phase = "REELWATCH"
+        else
+            startMacroCycle()
+        end
     elseif p == "APPRAISE"    then updateAppraisePhase()
     end
 end
@@ -4293,7 +4307,11 @@ function GUI:_renderWidget(w, bx, by, bw)
             for _, it in ipairs(w.allItems or w.items) do if w.selected[it] then n = n + 1; only = it end end
             headerVal = (n == 0 and "None") or (n == 1 and only) or (n .. " selected")
         elseif w.searchable then
-            headerVal = tostring(w.selName or "?")
+            if w.preserveFilter and w.filter and w.filter ~= "" then
+                headerVal = tostring(w.filter)
+            else
+                headerVal = tostring(w.selName or "?")
+            end
         else
             headerVal = tostring(w.items[w.idx] or "?")
         end
@@ -4540,6 +4558,9 @@ function GUI:PollSearchKeys(w)
         if edge(vk) then w.filter = (w.filter or "") .. string.char(vk); changed = true end
     end
     if edge(0x20) then w.filter = (w.filter or "") .. " "; changed = true end
+    if edge(0xBC) then w.filter = (w.filter or "") .. ","; changed = true end
+    if edge(0xBD) or edge(0x6D) then w.filter = (w.filter or "") .. "-"; changed = true end
+    if edge(0xBE) or edge(0x6E) then w.filter = (w.filter or "") .. "."; changed = true end
     if edge(0x08) then
         if #(w.filter or "") > 0 then w.filter = string.sub(w.filter, 1, -2); changed = true end
     end
@@ -4747,6 +4768,9 @@ function GUI:HandleClick(mx, my)
                 end
             end
 
+            if w.searchable and w.preserveFilter and w.filter and w.filter ~= "" then
+                w.selName = w.filter
+            end
             w.open = false; self:BuildWidgets(); return
         end
     end
@@ -4778,13 +4802,23 @@ function GUI:HandleClick(mx, my)
             elseif w.kind == "dropdown" then
 
                 for _, ow in ipairs(tab.widgets) do
-                    if ow.kind == "dropdown" and ow ~= w then ow.open = false end
+                    if ow.kind == "dropdown" and ow ~= w then
+                        if ow.searchable and ow.preserveFilter and ow.filter and ow.filter ~= "" then
+                            ow.selName = ow.filter
+                        end
+                        ow.open = false
+                    end
+                end
+                if w.open and w.searchable and w.preserveFilter and w.filter and w.filter ~= "" then
+                    w.selName = w.filter
                 end
                 w.open = not w.open
                 w.ddScroll = 0
 
                 if w.open and w.searchable then
-                    w.filter = ""
+                    if not w.preserveFilter then
+                        w.filter = ""
+                    end
                     self:FilterDropdown(w)
                 end
                 self:BuildWidgets()
@@ -4949,7 +4983,7 @@ function GUI:_hover(mx, my)
     if item then self:_hoverColor(item, typ, true) end
 end
 
-do
+;(function()
     local t = GUI:AddTab("Dashboard")
     t:Section("Control")
 
@@ -5013,50 +5047,58 @@ do
     t:Label("Fish / Hour:   0.0",      { liveId = "fph" })
     t:Label("Cast Timeouts: 0",        { liveId = "timeouts" })
     t:Label("Totems Popped: 0",        { liveId = "pops" })
-end
+end)()
 
-do
+;(function()
     local cat = GUI:AddCategory("Fishing")
 
-    local pc = cat:AddPanel("Cast")
-    pc:Section("Casting")
-    local castModes = {"Perfect", "Short", "Custom"}
-    local castIdx = (MAIN.cast_mode == "short" and 2) or (MAIN.cast_mode == "custom" and 3) or 1
-    pc:Dropdown("Cast Mode", castModes, castIdx, function(idx)
-        MAIN.cast_mode = ({"perfect","short","custom"})[idx]; saveSettings()
-    end)
-    pc:Slider("Cast Power (Custom %)",  1.0, 100.0, MAIN.cast_power_custom,  { fmt="%.1f" }, function(v) MAIN.cast_power_custom=v; saveSettings() end)
-    pc:Slider("Cast Timeout (ms)",      5000, 60000, MAIN.cast_timeout_ms,   { int=true, fmt="%d" }, function(v) MAIN.cast_timeout_ms=v; saveSettings() end)
-    pc:Slider("Cycle Start Delay (ms)", 0, 5000, MAIN.pre_cast_delay_ms,    { int=true, fmt="%d" }, function(v) MAIN.pre_cast_delay_ms=v; saveSettings() end)
-    pc:Slider("Post-Cast Delay (ms)",   0, 5000, MAIN.post_cast_delay_ms,   { int=true, fmt="%d" }, function(v) MAIN.post_cast_delay_ms=v; saveSettings() end)
-    pc:Toggle("Re-cast on Timeout", MAIN.cast_on_timeout == 1,
-        function(v) MAIN.cast_on_timeout = v and 1 or 0; saveSettings() end)
+    do
+        local pc = cat:AddPanel("Cast")
+        pc:Section("Casting")
+        local castModes = {"Perfect", "Short", "Custom"}
+        local castIdx = (MAIN.cast_mode == "short" and 2) or (MAIN.cast_mode == "custom" and 3) or 1
+        pc:Dropdown("Cast Mode", castModes, castIdx, function(idx)
+            MAIN.cast_mode = ({"perfect","short","custom"})[idx]; saveSettings()
+        end)
+        pc:Slider("Cast Power (Custom %)",  1.0, 100.0, MAIN.cast_power_custom,  { fmt="%.1f" }, function(v) MAIN.cast_power_custom=v; saveSettings() end)
+        pc:Slider("Cast Timeout (ms)",      5000, 60000, MAIN.cast_timeout_ms,   { int=true, fmt="%d" }, function(v) MAIN.cast_timeout_ms=v; saveSettings() end)
+        pc:Slider("Cycle Start Delay (ms)", 0, 5000, MAIN.pre_cast_delay_ms,    { int=true, fmt="%d" }, function(v) MAIN.pre_cast_delay_ms=v; saveSettings() end)
+        pc:Slider("Post-Cast Delay (ms)",   0, 5000, MAIN.post_cast_delay_ms,   { int=true, fmt="%d" }, function(v) MAIN.post_cast_delay_ms=v; saveSettings() end)
+        pc:Toggle("Re-cast on Timeout", MAIN.cast_on_timeout == 1,
+            function(v) MAIN.cast_on_timeout = v and 1 or 0; saveSettings() end)
+    end
 
-    local pr = cat:AddPanel("Reel")
-    pr:Section("Fishing")
-    pr:Slider("Fishing Action Delay (ms)",   0, 500, MAIN.fishing_action_delay_ms, { int=true, fmt="%d" }, function(v) MAIN.fishing_action_delay_ms=v; saveSettings() end)
-    pr:Slider("Completion Threshold (%)",    0.0, 100.0, MAIN.completion_threshold, { fmt="%.1f" }, function(v) MAIN.completion_threshold=v; saveSettings() end)
-    pr:Slider("Shake Interval (ms)",         1, 500, MAIN.shake_interval_ms,        { int=true, fmt="%d" }, function(v) MAIN.shake_interval_ms=v; saveSettings() end)
+    do
+        local pr = cat:AddPanel("Reel")
+        pr:Section("Fishing")
+        pr:Slider("Fishing Action Delay (ms)",   0, 500, MAIN.fishing_action_delay_ms, { int=true, fmt="%d" }, function(v) MAIN.fishing_action_delay_ms=v; saveSettings() end)
+        pr:Slider("Completion Threshold (%)",    0.0, 100.0, MAIN.completion_threshold, { fmt="%.1f" }, function(v) MAIN.completion_threshold=v; saveSettings() end)
+        pr:Slider("Shake Interval (ms)",         1, 500, MAIN.shake_interval_ms,        { int=true, fmt="%d" }, function(v) MAIN.shake_interval_ms=v; saveSettings() end)
+    end
 
-    local pl = cat:AddPanel("Lullaby")
-    pl:Section("Lullaby (Metronome)")
-    pl:Label("Auto-clicks the needle boxes for +Progress Speed (Lullaby only).", { color = THEME.subtext, size = 12 })
-    pl:Label("Set the Mode to match what your rod is on (boxes differ per mode).", { color = THEME.subtext, size = 12 })
-    local li = 1
-    for i = 1, #RP.lullabyModes do if RP.lullabyModes[i] == MAIN.lullaby_mode then li = i end end
-    pl:Dropdown("Mode", RP.lullabyModeLabels, li,
-        function(idx) MAIN.lullaby_mode = RP.lullabyModes[idx] or "prismatic"; saveSettings() end)
+    do
+        local pl = cat:AddPanel("Lullaby")
+        pl:Section("Lullaby (Metronome)")
+        pl:Label("Auto-clicks the needle boxes for +Progress Speed (Lullaby only).", { color = THEME.subtext, size = 12 })
+        pl:Label("Set the Mode to match what your rod is on (boxes differ per mode).", { color = THEME.subtext, size = 12 })
+        local li = 1
+        for i = 1, #RP.lullabyModes do if RP.lullabyModes[i] == MAIN.lullaby_mode then li = i end end
+        pl:Dropdown("Mode", RP.lullabyModeLabels, li,
+            function(idx) MAIN.lullaby_mode = RP.lullabyModes[idx] or "prismatic"; saveSettings() end)
+    end
 
-    local prl = cat:AddPanel("Reliability")
-    prl:Section("Reliability")
-    prl:Label("Re-equips a dropped rod + restarts if it gets stuck (for AFK).", { color = THEME.subtext, size = 12 })
-    prl:Toggle("Stall Watchdog", MAIN.watchdog_enabled == 1,
-        function(v) MAIN.watchdog_enabled = v and 1 or 0; saveSettings() end)
-    prl:Slider("Stall Timeout (s)", 8, 60, MAIN.watchdog_stall_sec, { int=true, fmt="%d" },
-        function(v) MAIN.watchdog_stall_sec=v; saveSettings() end)
-end
+    do
+        local prl = cat:AddPanel("Reliability")
+        prl:Section("Reliability")
+        prl:Label("Re-equips a dropped rod + restarts if it gets stuck (for AFK).", { color = THEME.subtext, size = 12 })
+        prl:Toggle("Stall Watchdog", MAIN.watchdog_enabled == 1,
+            function(v) MAIN.watchdog_enabled = v and 1 or 0; saveSettings() end)
+        prl:Slider("Stall Timeout (s)", 8, 60, MAIN.watchdog_stall_sec, { int=true, fmt="%d" },
+            function(v) MAIN.watchdog_stall_sec=v; saveSettings() end)
+    end
+end)()
 
-do
+;(function()
     local t = GUI:AddTab("Appraise")
     t:Section("Auto Appraise")
     t:Toggle("Master Switch", MAIN.auto_appraise_enabled == 1,
@@ -5087,9 +5129,9 @@ do
     t:Label("2. Hold the fish + hover the cursor over the in-game Appraise button.", { color = THEME.subtext })
     t:Label("3. Press the APPRAISE hotkey (F5) and leave the cursor there.", { color = THEME.subtext })
     t:Label("Re-press (or Stop Appraise) to cancel. Auto-master + F1 still works too.", { color = THEME.subtext, size = 11 })
-end
+end)()
 
-do
+function RP.buildTotemTab()
     local t = GUI:AddTab("Totem")
     t:Section("!!! WARNING !!!")
     t:Label("THIS MIGHT BE DETECTABLE — I AM NOT SURE.", { color = THEME.danger, size = 14 })
@@ -5121,6 +5163,7 @@ do
         for i, v in ipairs(list) do if v == name then return i end end
         return 1
     end
+
     local dayItems = totemChoices()
     local dayWidget = t:Dropdown("Day Totem", dayItems, idxOf(dayItems, MAIN.auto_totem_day or "None"),
         function(_, val) MAIN.auto_totem_day = val or "None"; saveSettings() end)
@@ -5129,12 +5172,47 @@ do
         function(_, val) MAIN.auto_totem_night = val or "None"; saveSettings() end)
     t:Button("Refresh Totem List", function()
         local di = totemChoices()
-        dayWidget.items = di;   dayWidget.idx   = idxOf(di, MAIN.auto_totem_day or "None")
+        dayWidget.items = di; dayWidget.idx = idxOf(di, MAIN.auto_totem_day or "None")
         local ni = totemChoices()
         nightWidget.items = ni; nightWidget.idx = idxOf(ni, MAIN.auto_totem_night or "None")
         notify(#di > 1 and ("Totems: " .. table.concat(di, ", ", 2)) or "No totems on hotbar.", "Auto Totem", 4)
     end)
     t:Label("Cycle: --   State: IDLE", { liveId = "totemcycle" })
+end
+RP.buildTotemTab()
+RP.buildTotemTab = nil
+
+RP.GPS = { active = false, x = 0, y = 0, z = 0, label = nil, dot = nil, status = "No waypoint set." }
+
+function RP.gpsSet(raw)
+    raw = tostring(raw or "")
+    local nums = {}
+    for n in raw:gmatch("[-+]?%d*%.?%d+") do nums[#nums + 1] = tonumber(n) end
+    if #nums < 3 then
+        RP.GPS.status = "Enter coordinates as X, Y, Z."
+        notify(RP.GPS.status, "GPS", 3)
+        return false
+    end
+    RP.GPS.x, RP.GPS.y, RP.GPS.z = nums[1], nums[2], nums[3]
+    RP.GPS.active = true
+    RP.GPS.status = string.format("Waypoint: %.1f, %.1f, %.1f", nums[1], nums[2], nums[3])
+    notify("GPS waypoint set.", "GPS", 2)
+    return true
+end
+
+function RP.gpsClear()
+    RP.GPS.active = false
+    RP.GPS.status = "No waypoint set."
+    if RP.GPS.label then pcall(_setIndex, RP.GPS.label, "Visible", false) end
+    if RP.GPS.dot then pcall(_setIndex, RP.GPS.dot, "Visible", false) end
+end
+
+function RP.gpsCurrent()
+    local hrp = getHRP()
+    if not hrp then notify("Could not read your position.", "GPS", 3); return nil end
+    local ok, p = pcall(_index, hrp, "Position")
+    if not ok or not p then notify("Could not read your position.", "GPS", 3); return nil end
+    return string.format("%.1f, %.1f, %.1f", p.X, p.Y, p.Z)
 end
 
 do
@@ -5156,6 +5234,104 @@ do
     addTp("fishAreas", "Fish Areas")
     addTp("spots",     "Spots")
 end
+
+;(function()
+    local t = GUI:AddTab("GPS")
+    t:Section("Coordinate Finder")
+
+    local gpsX = t:SearchDropdown("X Coordinate", { "19498" }, function() end)
+    local gpsY = t:SearchDropdown("Y Coordinate", { "335" }, function() end)
+    local gpsZ = t:SearchDropdown("Z Coordinate", { "5553" }, function() end)
+    gpsX.selName, gpsY.selName, gpsZ.selName = "19498", "335", "5553"
+    gpsX.filter, gpsY.filter, gpsZ.filter = "19498", "335", "5553"
+    gpsX.preserveFilter, gpsY.preserveFilter, gpsZ.preserveFilter = true, true, true
+
+    t:Label("Click each box and type one coordinate. Minus signs and decimals work.", { color = THEME.subtext, size = 11 })
+    t:Button("Set GPS Waypoint", function()
+        local x = (gpsX.filter and gpsX.filter ~= "") and gpsX.filter or gpsX.selName
+        local y = (gpsY.filter and gpsY.filter ~= "") and gpsY.filter or gpsY.selName
+        local z = (gpsZ.filter and gpsZ.filter ~= "") and gpsZ.filter or gpsZ.selName
+        RP.gpsSet(tostring(x or "") .. "," .. tostring(y or "") .. "," .. tostring(z or ""))
+    end)
+    t:Button("Use My Current Position", function()
+        local raw = RP.gpsCurrent()
+        if raw then
+            local vals = {}
+            for n in raw:gmatch("[-+]?%d*%.?%d+") do vals[#vals + 1] = n end
+            if #vals >= 3 then
+                gpsX.filter, gpsX.selName = vals[1], vals[1]
+                gpsY.filter, gpsY.selName = vals[2], vals[2]
+                gpsZ.filter, gpsZ.selName = vals[3], vals[3]
+                GUI:BuildWidgets()
+                RP.gpsSet(raw)
+            end
+        end
+    end)
+    t:Button("Clear GPS Waypoint", function() RP.gpsClear() end)
+    t:Label("No waypoint set.", { liveId = "gps_status", color = THEME.accent, size = 12 })
+    t:Label("The waypoint uses a small dot and compact distance label.", { color = THEME.subtext, size = 11 })
+end)()
+
+-- Start the GPS renderer immediately when the script loads.
+task.spawn(function()
+    if type(WorldToScreen) ~= "function" or not Drawing or type(Drawing.new) ~= "function" then
+        RP.GPS.status = "GPS marker unavailable in this executor."
+        return
+    end
+
+    RP.GPS.label = Drawing.new("Text")
+    RP.GPS.label.Size = 15
+    RP.GPS.label.Center = true
+    RP.GPS.label.Outline = true
+    RP.GPS.label.Visible = false
+
+    RP.GPS.dot = Drawing.new("Circle")
+    RP.GPS.dot.Radius = 3
+    RP.GPS.dot.Filled = true
+    RP.GPS.dot.Visible = false
+
+    while not KILL do
+        if RP.GPS.active then
+            local target = Vector3.new(RP.GPS.x, RP.GPS.y, RP.GPS.z)
+            local ok, a, b, c = pcall(WorldToScreen, target)
+            local sx, sy, visible = nil, nil, true
+
+            if ok then
+                if type(a) == "number" and type(b) == "number" then
+                    sx, sy = a, b
+                    if type(c) == "boolean" then visible = c end
+                elseif a then
+                    pcall(function() sx, sy = a.X, a.Y end)
+                    if type(b) == "boolean" then visible = b end
+                end
+            end
+
+            local distance = nil
+            local hrp = getHRP()
+            if hrp then
+                local okp, pos = pcall(_index, hrp, "Position")
+                if okp and pos then pcall(function() distance = (pos - target).Magnitude end) end
+            end
+
+            if sx and sy and visible ~= false then
+                RP.GPS.label.Text = distance and string.format("GPS %d", math.floor(distance + 0.5)) or "GPS"
+                RP.GPS.label.Position = Vector2.new(sx, sy - 15)
+                RP.GPS.dot.Position = Vector2.new(sx, sy)
+                RP.GPS.label.Visible = true
+                RP.GPS.dot.Visible = true
+                RP.GPS.status = string.format("Waypoint: %.1f, %.1f, %.1f%s", RP.GPS.x, RP.GPS.y, RP.GPS.z, distance and string.format("  •  %d studs", math.floor(distance + 0.5)) or "")
+            else
+                RP.GPS.label.Visible = false
+                RP.GPS.dot.Visible = false
+                RP.GPS.status = string.format("Waypoint: %.1f, %.1f, %.1f  •  off-screen", RP.GPS.x, RP.GPS.y, RP.GPS.z)
+            end
+        else
+            RP.GPS.label.Visible = false
+            RP.GPS.dot.Visible = false
+        end
+        task.wait(0.03)
+    end
+end)
 
 do
     local cat = GUI:AddCategory("Hunts")
@@ -5191,7 +5367,7 @@ do
     end
 end
 
-do
+;(function()
     local t = GUI:AddTab("Weather")
     t:Section("Auto Weather")
     t:Toggle("Auto Weather", MAIN.auto_weather_enabled == 1,
@@ -5220,9 +5396,9 @@ do
     t:Label("Special: —", { liveId = "wx_special", color = THEME.text,   size = 12 })
     t:Label("Event:   —", { liveId = "wx_event",   color = THEME.text,   size = 12 })
     t:Label("Target:  —", { liveId = "wx_target",  color = THEME.accent, size = 12 })
-end
+end)()
 
-do
+;(function()
     local t = GUI:AddTab("Misc")
     t:Section("Daily Shop")
     t:Label("Refresh: —", { liveId = "misc_shop_timer", color = THEME.subtext, size = 12 })
@@ -5233,9 +5409,9 @@ do
     t:Label("Spawns: —", { liveId = "misc_chest", color = THEME.text, size = 13 })
     t:Section("Orca Migration")
     t:Label("Spawns: —", { liveId = "misc_orca", color = THEME.text, size = 13 })
-end
+end)()
 
-do
+;(function()
     local cat = GUI:AddCategory("Webhook")
 
     local ps = cat:AddPanel("Summary")
@@ -5295,9 +5471,9 @@ do
     ph:MultiSelect("Hunts to Webhook", HD.allNames(), HD.selectedList(),
         function(arr) MAIN.hunt_alerts_selected = table.concat(arr, ","); saveSettings() end, true)
     ph:Label("Click to open, TYPE to filter, click hunts to toggle. Uses @Mention if on.", { color = THEME.subtext, size = 11 })
-end
+end)()
 
-do
+;(function()
     local t = GUI:AddTab("About")
     t:Section("Hotkeys  (click a row, then press a key)")
     t:Keybind("Start / Stop",       "hk_start_macro")
@@ -5342,7 +5518,7 @@ do
         WebhookSession.lastSummaryAt= 0
         notify("Stats reset.", "ZeroDeath fisch", 2)
     end)
-end
+end)()
 
 GUI:Rebuild()
 
@@ -5470,6 +5646,7 @@ task.spawn(function()
             GUI:SetLabel("appraise_status", "Status: " .. appraiseStatus)
 
             GUI:SetLabel("tp_status", "Status: " .. TP.status)
+            GUI:SetLabel("gps_status", RP.GPS.status)
 
             GUI:SetLabel("hunt_detected", "Detected: " .. (HUNT.detected or "none"))
             local nh = #HUNT.active
