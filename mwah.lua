@@ -2818,18 +2818,50 @@ end
 local function updateShakePhase()
     Macro.powerPercent = ""; Macro.progressPercent = ""
     releaseMouse()
+
     if isTranquilityRod(ROD) and getTranquilityLaneContainer() then
         Macro.lastShakedAt = 0; Macro.fishingLostAt = 0
         Macro.phase = "TRANQUILITY"; return
     end
+
     if hasActiveFishingContext() then
         Macro.lastShakedAt = 0; Macro.fishingLostAt = 0
         Macro.phase = "FISHING"; return
     end
-    if Macro.lastShakedAt == 0 or (tick()*1000 - Macro.lastShakedAt) >= Macro.shakingIntervalMs then
-        sendEnter()
+
+    local nowMs = tick() * 1000
+    if Macro.lastShakedAt == 0 or (nowMs - Macro.lastShakedAt) >= Macro.shakingIntervalMs then
+        local btn = RP.shakeButtonInst()
+        local clicked = false
+
+        if btn then
+            local cx, cy = RP.readAbsCenter(btn)
+            if cx and cy then
+                reliableScreenClick(cx, cy)
+                clicked = true
+
+                -- Some shake prompts survive the first click because their
+                -- position changes during the same frame. Re-read and retry.
+                task.wait(0.035)
+                local retryBtn = RP.shakeButtonInst()
+                if retryBtn then
+                    local rx, ry = RP.readAbsCenter(retryBtn)
+                    if rx and ry then
+                        reliableScreenClick(rx, ry)
+                    end
+                end
+            end
+        end
+
+        -- Keyboard fallback for prompts whose absolute bounds are temporarily
+        -- unavailable or when Matcha fails to move/click the cursor.
+        if not clicked then
+            sendEnter()
+        end
+
         Macro.lastShakedAt = tick() * 1000
     end
+
     if Macro.castReleasedAt > 0 and (tick()*1000 - Macro.castReleasedAt) >= Macro.castWaitTimeoutMs then
         startMacroCycle()
     end
