@@ -186,6 +186,7 @@ local DEFAULTS = {
     cast_on_timeout        = 1,
 
     auto_reel_only         = 0,
+    instant_mode           = 0,
 
     show_status_hud        = 1,
     hud_x                  = 16,
@@ -542,6 +543,7 @@ local mouseHeld = false
 local lastActionAt = 0
 
 function RP.actionDelay()
+    if MAIN.instant_mode == 1 then return 0 end
     local base = MAIN.fishing_action_delay_ms or 0
     if ROD_KIND == "requiem" and base < 160 then return 160 end
     return base
@@ -1453,29 +1455,97 @@ function Controller:Update(ctx)
 end
 
 function RP.getAllReelContexts()
-    local pg = getPlayerGui(); if not pg then return {} end
+    local pg = getPlayerGui()
+    if not pg then return {} end
+
     local out = {}
-    local ok, kids = pcall(pg.GetChildren, pg)
-    if not ok or not kids then return out end
-    for _, ch in ipairs(kids) do
-        if ch.Name == "reel" and isScreenGuiEnabled(ch) then
-            local bar = findChild(ch, "bar")
-            if bar and isGuiVisible(bar) then
-                local fish = findChild(bar, "fish")
-                local pbar = findChild(bar, "playerbar")
-                if fish and pbar and isGuiVisible(fish) and isGuiVisible(pbar) then
-                    local x = 0
-                    local okP, pos = pcall(_index, bar, "AbsolutePosition")
-                    if okP and pos then
-                        local okx, px = pcall(_index, pos, "X")
-                        if okx and px then x = px end
+    local seenBars = {}
+
+    local function addBar(bar)
+        if not bar then return end
+
+        local barAddr = instAddr(bar) or tostring(bar)
+        if seenBars[barAddr] then return end
+
+        local fish = findChild(bar, "fish")
+        local pbar = findChild(bar, "playerbar")
+        if not (fish and pbar) then return end
+
+        local okBP, bp = pcall(_index, bar, "AbsolutePosition")
+        local okBS, bs = pcall(_index, bar, "AbsoluteSize")
+        local okFP, fp = pcall(_index, fish, "AbsolutePosition")
+        local okFS, fs = pcall(_index, fish, "AbsoluteSize")
+        local okPP, pp = pcall(_index, pbar, "AbsolutePosition")
+        local okPS, ps = pcall(_index, pbar, "AbsoluteSize")
+
+        if not (okBP and okBS and okFP and okFS and okPP and okPS
+            and bp and bs and fp and fs and pp and ps) then
+            return
+        end
+
+        local bx, by = bp.X, bp.Y
+        local bw, bh = bs.X, bs.Y
+        local fw, fh = fs.X, fs.Y
+        local pw, ph = ps.X, ps.Y
+
+        if not (bx and by and bw and bh and fw and fh and pw and ph) then return end
+        if bw <= 10 or bh <= 2 or fw <= 0 or fh <= 0 or pw <= 1 or ph <= 1 then return end
+
+        seenBars[barAddr] = true
+        out[#out + 1] = {
+            bar = bar,
+            fish = fish,
+            playerbar = pbar,
+            x = bx,
+            y = by,
+            width = bw,
+            address = barAddr,
+        }
+    end
+
+    -- Bellona creates two separate ScreenGuis with the same name.
+    local okKids, kids = pcall(pg.GetChildren, pg)
+    if okKids and kids then
+        for _, ch in ipairs(kids) do
+            local okName, name = pcall(_index, ch, "Name")
+            if okName and name == "reel" then
+                addBar(findChild(ch, "bar"))
+            end
+        end
+    end
+
+    -- Matcha may omit one duplicate reel from direct child enumeration.
+    if #out < 2 then
+        local queue, head = { pg }, 1
+        while head <= #queue and head <= 4096 do
+            local cur = queue[head]
+            head = head + 1
+
+            local ok, ch = pcall(cur.GetChildren, cur)
+            if ok and ch then
+                for _, c in ipairs(ch) do
+                    local okName, name = pcall(_index, c, "Name")
+                    if okName and name == "bar" then
+                        local parent = nil
+                        local okParent, p = pcall(_index, c, "Parent")
+                        if okParent then parent = p end
+
+                        local okParentName, parentName = pcall(_index, parent, "Name")
+                        if okParentName and parentName == "reel" then
+                            addBar(c)
+                        end
                     end
-                    table.insert(out, { bar = bar, fish = fish, playerbar = pbar, x = x })
+                    queue[#queue + 1] = c
                 end
             end
         end
     end
-    table.sort(out, function(a, b) return a.x < b.x end)
+
+    table.sort(out, function(a, b)
+        if a.x == b.x then return a.y < b.y end
+        return a.x < b.x
+    end)
+
     return out
 end
 
@@ -2622,6 +2692,12 @@ controllerR.button = "rmb"
 
 local function fishingMinigameActive()
     if isTranquilityRod(ROD) and getTranquilityLaneContainer() then return "TRANQUILITY" end
+
+    if ROD_KIND == "bellona" then
+        local reels = RP.getAllReelContexts()
+        if #reels > 0 then return "FISHING" end
+    end
+
     if reelGuiVisible() and hasActiveFishingContext() then return "FISHING" end
     return nil
 end
@@ -2830,33 +2906,44 @@ local function updateShakePhase()
     end
 
     local nowMs = tick() * 1000
-    if Macro.lastShakedAt == 0 or (nowMs - Macro.lastShakedAt) >= Macro.shakingIntervalMs then
+    local shakeDelay = MAIN.instant_mode == 1 and 1 or Macro.shakingIntervalMs
+
+    if Macro.lastShakedAt == 0 or (nowMs - Macro.lastShakedAt) >= shakeDelay then
         local btn = RP.shakeButtonInst()
         local clicked = false
 
         if btn then
             local cx, cy = RP.readAbsCenter(btn)
             if cx and cy then
-                reliableScreenClick(cx, cy)
+                if MAIN.instant_mode == 1 then
+                    pcall(mousemoveabs, 0, cx, cy)
+                    mouse1press()
+                    mouse1release()
+                else
+                    reliableScreenClick(cx, cy)
+                end
                 clicked = true
 
-                -- Some shake prompts survive the first click because their
-                -- position changes during the same frame. Re-read and retry.
-                task.wait(0.035)
-                local retryBtn = RP.shakeButtonInst()
-                if retryBtn then
-                    local rx, ry = RP.readAbsCenter(retryBtn)
-                    if rx and ry then
-                        reliableScreenClick(rx, ry)
+                if MAIN.instant_mode ~= 1 then
+                    task.wait(0.035)
+                    local retryBtn = RP.shakeButtonInst()
+                    if retryBtn then
+                        local rx, ry = RP.readAbsCenter(retryBtn)
+                        if rx and ry then
+                            reliableScreenClick(rx, ry)
+                        end
                     end
                 end
             end
         end
 
-        -- Keyboard fallback for prompts whose absolute bounds are temporarily
-        -- unavailable or when Matcha fails to move/click the cursor.
         if not clicked then
-            sendEnter()
+            if MAIN.instant_mode == 1 then
+                keypress(VK.Enter)
+                keyrelease(VK.Enter)
+            else
+                sendEnter()
+            end
         end
 
         Macro.lastShakedAt = tick() * 1000
@@ -2888,24 +2975,42 @@ local function updateFishingPhase()
         return
     end
 
-    if ROD_KIND == "bellona" and visible then
+    if ROD_KIND == "bellona" then
         local reels = RP.getAllReelContexts()
-        Macro.reelMissingAt = 0
-        Macro.reelLastContextAt = nowMs
-        if #reels >= 2 then
-            Macro.bellonaMidX = (reels[1].x + reels[#reels].x) / 2
-            controller:Update(reels[1]); controllerR:Update(reels[#reels])
-        elseif #reels == 1 then
-            local r = reels[1]
-            if Macro.bellonaMidX and r.x > Macro.bellonaMidX then
-                controllerR:Update(r); releaseMouse(); controller:Reset()
+
+        if #reels > 0 then
+            Macro.reelMissingAt = 0
+            Macro.reelLastContextAt = nowMs
+
+            if #reels >= 2 then
+                local leftCtx = reels[1]
+                local rightCtx = reels[#reels]
+
+                Macro.bellonaMidX = (leftCtx.x + rightCtx.x) * 0.5
+
+                controller.button = "lmb"
+                controllerR.button = "rmb"
+
+                controller:Update(leftCtx)
+                controllerR:Update(rightCtx)
             else
-                controller:Update(r); RP.releaseMouse2(); controllerR:Reset()
+                local remainingCtx = reels[1]
+
+                if Macro.bellonaMidX and remainingCtx.x > Macro.bellonaMidX then
+                    releaseMouse(true)
+                    controller:Reset()
+                    controllerR.button = "rmb"
+                    controllerR:Update(remainingCtx)
+                else
+                    RP.releaseMouse2()
+                    controllerR:Reset()
+                    controller.button = "lmb"
+                    controller:Update(remainingCtx)
+                end
             end
-        else
-            releaseMouse(); RP.releaseMouse2()
+
+            return
         end
-        return
     end
 
     if ctx and hasActiveFishingContext(ctx) then
@@ -5106,6 +5211,13 @@ end)()
         pr:Slider("Fishing Action Delay (ms)",   0, 500, MAIN.fishing_action_delay_ms, { int=true, fmt="%d" }, function(v) MAIN.fishing_action_delay_ms=v; saveSettings() end)
         pr:Slider("Completion Threshold (%)",    0.0, 100.0, MAIN.completion_threshold, { fmt="%.1f" }, function(v) MAIN.completion_threshold=v; saveSettings() end)
         pr:Slider("Shake Interval (ms)",         1, 500, MAIN.shake_interval_ms,        { int=true, fmt="%d" }, function(v) MAIN.shake_interval_ms=v; saveSettings() end)
+        pr:Toggle("Instant Mode", MAIN.instant_mode == 1,
+            function(v)
+                MAIN.instant_mode = v and 1 or 0
+                Macro.lastShakedAt = 0
+                saveSettings()
+                notify("Instant Mode: " .. (v and "ON" or "OFF"), "ZeroDeath fisch", 2)
+            end)
     end
 
     do
