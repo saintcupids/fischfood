@@ -144,6 +144,107 @@ local function readFrameSize(frame)
     return readFloat(base + 0x0), readInt(base + 0x4), readFloat(base + 0x8), readInt(base + 0xC)
 end
 
+function RP.finiteNumber(v)
+    return type(v) == "number"
+       and v == v
+       and v ~= math.huge
+       and v ~= -math.huge
+end
+
+function RP.readNormalizedReelMetrics(ctx)
+    if not ctx or not ctx.bar or not ctx.fish or not ctx.playerbar then
+        return nil
+    end
+
+    -- Prefer normal Roblox absolute geometry when Matcha exposes it correctly.
+    local ok0, bp = pcall(_index, ctx.bar, "AbsolutePosition")
+    local ok1, bs = pcall(_index, ctx.bar, "AbsoluteSize")
+    local ok2, fp = pcall(_index, ctx.fish, "AbsolutePosition")
+    local ok3, fs = pcall(_index, ctx.fish, "AbsoluteSize")
+    local ok4, pp = pcall(_index, ctx.playerbar, "AbsolutePosition")
+    local ok5, ps = pcall(_index, ctx.playerbar, "AbsoluteSize")
+
+    if ok0 and ok1 and ok2 and ok3 and ok4 and ok5
+       and bp and bs and fp and fs and pp and ps
+       and RP.finiteNumber(bp.X) and RP.finiteNumber(bs.X)
+       and RP.finiteNumber(fp.X) and RP.finiteNumber(fs.X)
+       and RP.finiteNumber(pp.X) and RP.finiteNumber(ps.X)
+       and bs.X > 1 then
+
+        local fishCenter = ((fp.X + fs.X * 0.5) - bp.X) / bs.X
+        local barCenter  = ((pp.X + ps.X * 0.5) - bp.X) / bs.X
+        local barWidth   = ps.X / bs.X
+
+        if RP.finiteNumber(fishCenter)
+           and RP.finiteNumber(barCenter)
+           and RP.finiteNumber(barWidth)
+           and barWidth > 0 then
+            return fishCenter, barCenter, barWidth, "absolute"
+        end
+    end
+
+    -- Matcha currently returns zeroed AbsolutePosition/AbsoluteSize values.
+    -- Fall back to the UDim2 values read from memory.
+    local barPX, barOX = readFramePos(ctx.bar)
+    local barSX, barSOX = readFrameSize(ctx.bar)
+    local fishPX, fishOX = readFramePos(ctx.fish)
+    local fishSX, fishSOX = readFrameSize(ctx.fish)
+    local playerPX, playerOX = readFramePos(ctx.playerbar)
+    local playerSX, playerSOX = readFrameSize(ctx.playerbar)
+
+    if not (RP.finiteNumber(barPX) and RP.finiteNumber(barOX)
+        and RP.finiteNumber(barSX) and RP.finiteNumber(barSOX)
+        and RP.finiteNumber(fishPX) and RP.finiteNumber(fishOX)
+        and RP.finiteNumber(fishSX) and RP.finiteNumber(fishSOX)
+        and RP.finiteNumber(playerPX) and RP.finiteNumber(playerOX)
+        and RP.finiteNumber(playerSX) and RP.finiteNumber(playerSOX)) then
+        return nil
+    end
+
+    -- Position uses each object's AnchorPoint. The previous patch assumed
+    -- AnchorPoint.X == 0, which shifted centered reel elements to the right.
+    local function anchorX(inst)
+        local okA, ap = pcall(_index, inst, "AnchorPoint")
+        if okA and ap then
+            local okX, ax = pcall(_index, ap, "X")
+            if okX and finiteNumber(ax) then
+                return ax
+            end
+        end
+
+        -- Fisch's reel indicators are centered around their Position values.
+        return 0.5
+    end
+
+    local fishAX = anchorX(ctx.fish)
+    local playerAX = anchorX(ctx.playerbar)
+
+    local fishCenter = fishPX + ((0.5 - fishAX) * fishSX)
+    local barCenter  = playerPX + ((0.5 - playerAX) * playerSX)
+    local barWidth   = playerSX
+
+    -- Offsets are normally zero. Only use scale-based metrics when the
+    -- horizontal scale exists, since there is no reliable parent pixel width.
+    if math.abs(fishSX) < 0.000001 and fishSOX ~= 0 then
+        return nil
+    end
+    if math.abs(playerSX) < 0.000001 and playerSOX ~= 0 then
+        return nil
+    end
+
+    if not (RP.finiteNumber(fishCenter)
+        and RP.finiteNumber(barCenter)
+        and RP.finiteNumber(barWidth)) then
+        return nil
+    end
+
+    if barWidth <= 0 then
+        return nil
+    end
+
+    return fishCenter, barCenter, barWidth, "memory"
+end
+
 local function isScreenGuiEnabled(gui)
     if not gui then return false end
 
@@ -761,21 +862,27 @@ local function hasActiveFishingContext(ctx)
 end
 
 function RP.reelMetricsSane(ctx)
-    if not ctx or not ctx.bar or not ctx.fish or not ctx.playerbar then return false end
-    local ok0, bp = pcall(_index, ctx.bar, "AbsolutePosition")
-    local ok1, bs = pcall(_index, ctx.bar, "AbsoluteSize")
-    local ok2, fp = pcall(_index, ctx.fish, "AbsolutePosition")
-    local ok3, fs = pcall(_index, ctx.fish, "AbsoluteSize")
-    local ok4, pp = pcall(_index, ctx.playerbar, "AbsolutePosition")
-    local ok5, ps = pcall(_index, ctx.playerbar, "AbsoluteSize")
-    if not (ok0 and ok1 and ok2 and ok3 and ok4 and ok5 and bp and bs and fp and fs and pp and ps) then return false end
-    local bx, bwpx = bp.X, bs.X
-    if not bx or not bwpx or bwpx <= 1 then return false end
-    local fc = ((fp.X + fs.X * 0.5) - bx) / bwpx
-    local bc = ((pp.X + ps.X * 0.5) - bx) / bwpx
-    local bw = ps.X / bwpx
-    if MAIN.debug_logging == 1 then Macro.dbgFc, Macro.dbgBc, Macro.dbgBw = fc, bc, bw end
-    return fc == fc and bc == bc and bw == bw and fc >= -0.5 and fc <= 1.5 and bc >= -0.5 and bc <= 1.5 and bw > 0 and bw <= 2.0
+    local fc, bc, bw, source = RP.readNormalizedReelMetrics(ctx)
+
+    if not fc then
+        if MAIN.debug_logging == 1 then
+            Macro.dbgMetricSource = "none"
+        end
+        return false
+    end
+
+    if MAIN.debug_logging == 1 then
+        Macro.dbgFc = fc
+        Macro.dbgBc = bc
+        Macro.dbgBw = bw
+        Macro.dbgMetricSource = source
+    end
+
+    -- Allow the current reel's unusually tall fish indicator. Only horizontal
+    -- normalized values matter here.
+    return fc >= -0.75 and fc <= 1.75
+       and bc >= -0.75 and bc <= 1.75
+       and bw > 0 and bw <= 2.5
 end
 
 function RP.findDesc(root, name, depth)
@@ -1031,34 +1138,21 @@ end
 
 function Controller:GetFishPosition(ctx)
     ctx = ctx or getReelBarContext()
-    if not ctx or not ctx.bar or not ctx.fish then return nil end
-    local ok0, bp = pcall(_index, ctx.bar, "AbsolutePosition")
-    local ok1, bs = pcall(_index, ctx.bar, "AbsoluteSize")
-    local ok2, fp = pcall(_index, ctx.fish, "AbsolutePosition")
-    local ok3, fs = pcall(_index, ctx.fish, "AbsoluteSize")
-    if not (ok0 and ok1 and ok2 and ok3 and bp and bs and fp and fs and bs.X and bs.X > 1) then return nil end
-    local fishCenter = ((fp.X + fs.X * 0.5) - bp.X) / bs.X
-    if ROD_KIND == "pinion" and ctx.playerbar then
-        local ok4, pp = pcall(_index, ctx.playerbar, "AbsolutePosition")
-        local ok5, ps = pcall(_index, ctx.playerbar, "AbsoluteSize")
-        if ok4 and ok5 and pp and ps then
-            local bc = ((pp.X + ps.X * 0.5) - bp.X) / bs.X
-            local bw = ps.X / bs.X; if bw < 0.001 then bw = 0.001 end
-            fishCenter = RP.pinionAdjust(fishCenter, bc, bw)
-        end
+    local fishCenter, barCenter, barWidth = RP.readNormalizedReelMetrics(ctx)
+    if not fishCenter then return nil end
+
+    if ROD_KIND == "pinion" and ctx and ctx.playerbar then
+        barWidth = math.max(0.001, barWidth or 0.001)
+        fishCenter = RP.pinionAdjust(fishCenter, barCenter, barWidth)
     end
+
     return fishCenter
 end
 
 function Controller:GetPlayerbarPosition(ctx)
     ctx = ctx or getReelBarContext()
-    if not ctx or not ctx.bar or not ctx.playerbar then return nil end
-    local ok0, bp = pcall(_index, ctx.bar, "AbsolutePosition")
-    local ok1, bs = pcall(_index, ctx.bar, "AbsoluteSize")
-    local ok2, pp = pcall(_index, ctx.playerbar, "AbsolutePosition")
-    local ok3, ps = pcall(_index, ctx.playerbar, "AbsoluteSize")
-    if not (ok0 and ok1 and ok2 and ok3 and bp and bs and pp and ps and bs.X and bs.X > 1) then return nil end
-    return ((pp.X + ps.X * 0.5) - bp.X) / bs.X
+    local _, barCenter = RP.readNormalizedReelMetrics(ctx)
+    return barCenter
 end
 
 function Controller:IsInverted()
@@ -1165,20 +1259,17 @@ end
 
 function Controller:_metrics(ctx)
     ctx = ctx or getReelBarContext()
-    if not (ctx and ctx.bar and ctx.fish and ctx.playerbar) then return nil end
-    local ok0, bp = pcall(_index, ctx.bar, "AbsolutePosition")
-    local ok1, bs = pcall(_index, ctx.bar, "AbsoluteSize")
-    local ok2, fp = pcall(_index, ctx.fish, "AbsolutePosition")
-    local ok3, fs = pcall(_index, ctx.fish, "AbsoluteSize")
-    local ok4, pp = pcall(_index, ctx.playerbar, "AbsolutePosition")
-    local ok5, ps = pcall(_index, ctx.playerbar, "AbsoluteSize")
-    if not (ok0 and ok1 and ok2 and ok3 and ok4 and ok5 and bp and bs and fp and fs and pp and ps and bs.X and bs.X > 1) then return nil end
-    local fishCenter = ((fp.X + fs.X * 0.5) - bp.X) / bs.X
-    local barCenter = ((pp.X + ps.X * 0.5) - bp.X) / bs.X
-    local barWidth = ps.X / bs.X
-    if fishCenter ~= fishCenter or barCenter ~= barCenter then return nil end
-    if barWidth ~= barWidth or barWidth < 0.001 then barWidth = 0.001 end
-    if ROD_KIND == "pinion" then fishCenter = RP.pinionAdjust(fishCenter, barCenter, barWidth) end
+    local fishCenter, barCenter, barWidth = RP.readNormalizedReelMetrics(ctx)
+    if not fishCenter then return nil end
+
+    if barWidth < 0.001 then
+        barWidth = 0.001
+    end
+
+    if ROD_KIND == "pinion" then
+        fishCenter = RP.pinionAdjust(fishCenter, barCenter, barWidth)
+    end
+
     self.obsFish, self.obsBar = fishCenter, barCenter
     return fishCenter, barCenter, barWidth
 end
@@ -4180,7 +4271,15 @@ function Tab:Button(label, fn, liveId)
 end
 
 function Tab:Toggle(label, default, fn)
-    return self:_add({ kind = "toggle", label = label, value = default and true or false, fn = fn, height = 22 })
+    return self:_add({
+        kind = "toggle",
+        label = label,
+        value = default and true or false,
+        fn = fn,
+        height = 22,
+        _lastToggleAt = 0,
+        _toggleBusy = false,
+    })
 end
 
 function Tab:Slider(label, min, max, default, opts, fn)
@@ -4738,6 +4837,7 @@ function GUI:Hide()
     self.visible = false
     self._rebindTarget = nil
     self:CloseDropdowns()
+    self.anims = {}
     setVisible(self.staticDrawings, false)
     setVisible(self.sideDrawings, false)
     setVisible(self.subTabDrawings, false)
@@ -4745,11 +4845,57 @@ function GUI:Hide()
 end
 function GUI:Toggle() if self.visible then self:Hide() else self:Show() end end
 
+function GUI:_cancelAnim(draw)
+    if not draw then return end
+    for i = #self.anims, 1, -1 do
+        if self.anims[i].draw == draw then
+            table.remove(self.anims, i)
+        end
+    end
+end
+
 function GUI:_anim(draw, ax, ay, bx, by, durMs)
     if not draw then return end
+    self:_cancelAnim(draw)
     pcall(_setIndex, draw, "Position", Vector2.new(ax, ay))
-    self.anims[#self.anims + 1] = { draw = draw, ax = ax, ay = ay, bx = bx, by = by,
-        t0 = tick() * 1000, dur = durMs or 120 }
+    self.anims[#self.anims + 1] = {
+        draw = draw,
+        ax = ax,
+        ay = ay,
+        bx = bx,
+        by = by,
+        t0 = tick() * 1000,
+        dur = durMs or 120,
+    }
+end
+
+function GUI:_setToggleVisual(w, animate)
+    if not w then return end
+
+    local on = w.value == true
+    local col = on and THEME.accent or THEME.track
+
+    pcall(_setIndex, w._trackMid, "Color", col)
+    pcall(_setIndex, w._trackL, "Color", col)
+    pcall(_setIndex, w._trackR, "Color", col)
+    pcall(_setIndex, w._lblDraw, "Color", on and THEME.text or THEME.subtext)
+
+    local toX = on and w._knobX1 or w._knobX0
+    if not toX or not w._knobY or not w._knob then return end
+
+    local fromX = w._knobCur
+    if type(fromX) ~= "number" then
+        fromX = on and w._knobX0 or w._knobX1
+    end
+
+    w._knobCur = toX
+
+    if animate and math.abs(fromX - toX) > 0.01 then
+        self:_anim(w._knob, fromX, w._knobY, toX, w._knobY, 100)
+    else
+        self:_cancelAnim(w._knob)
+        pcall(_setIndex, w._knob, "Position", Vector2.new(toX, w._knobY))
+    end
 end
 
 function GUI:SetCategory(i)
@@ -4918,19 +5064,34 @@ function GUI:HandleClick(mx, my)
             if w.kind == "button" then
                 if w.fn then pcall(w.fn) end
             elseif w.kind == "toggle" then
-                w.value = not w.value
-                if w.fn then pcall(w.fn, w.value) end
+                local nowMs = tick() * 1000
 
-                local on = w.value
-                local col = on and THEME.accent or THEME.track
-                pcall(_setIndex, w._trackMid, "Color", col)
-                pcall(_setIndex, w._trackL, "Color", col)
-                pcall(_setIndex, w._trackR, "Color", col)
-                pcall(_setIndex, w._lblDraw, "Color", on and THEME.text or THEME.subtext)
-                local fromX = w._knobCur or (on and w._knobX0 or w._knobX1)
-                local toX   = on and w._knobX1 or w._knobX0
-                w._knobCur  = toX
-                self:_anim(w._knob, fromX, w._knobY, toX, w._knobY, 100)
+                -- Prevent rapid double-clicks and overlapping callbacks from
+                -- leaving the saved state and the visual state out of sync.
+                if w._toggleBusy or nowMs - (w._lastToggleAt or 0) < 160 then
+                    return
+                end
+
+                w._lastToggleAt = nowMs
+                w._toggleBusy = true
+
+                local previous = w.value == true
+                local nextValue = not previous
+                local ok, err = true, nil
+
+                if w.fn then
+                    ok, err = pcall(w.fn, nextValue)
+                end
+
+                if ok then
+                    w.value = nextValue
+                else
+                    w.value = previous
+                    warn("[ZeroDeath GUI] Toggle callback failed (" .. tostring(w.label) .. "): " .. tostring(err))
+                end
+
+                w._toggleBusy = false
+                self:_setToggleVisual(w, ok)
             elseif w.kind == "slider" then
                 if w._trackBox and pointInBox(mx, my, w._trackBox.x, w._trackBox.y, w._trackBox.w, w._trackBox.h) then
                     self.dragSlider = w
